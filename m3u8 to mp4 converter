@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import sys
+import time
+import subprocess
+import tkinter as tk
+from tkinter import filedialog
+from shutil import which
+
+# ------------------ File Picker Functions ------------------ #
+def pick_file(title="Select a file", filetypes=(("All files", "*.*"),)):
+    root = tk.Tk()
+    root.withdraw()
+    return filedialog.askopenfilename(title=title, filetypes=filetypes)
+
+def pick_save_as(title="Save as", defaultextension=".mp4"):
+    root = tk.Tk()
+    root.withdraw()
+    return filedialog.asksaveasfilename(title=title, defaultextension=defaultextension)
+
+# ------------------ Utility Functions ------------------ #
+def ffmpeg_available():
+    return which("ffmpeg") is not None
+
+def ffprobe_available():
+    return which("ffprobe") is not None
+
+def parse_kv_list(kv_list):
+    out = {}
+    if not kv_list:
+        return out
+    for item in kv_list:
+        if ":" in item:
+            k, v = item.split(":", 1)
+        elif "=" in item:
+            k, v = item.split("=", 1)
+        else:
+            raise ValueError(f"Header must contain ':' or '=': {item}")
+        out[k.strip()] = v.strip()
+    return out
+
+def build_header_string(headers_dict):
+    if not headers_dict:
+        return None
+    pairs = [f"{k}: {v}" for k, v in headers_dict.items()]
+    return "\\r\\n".join(pairs)
+
+def get_duration_seconds(input_url, headers=None, user_agent=None, timeout=15):
+    if not ffprobe_available():
+        return None
+    cmd = ["ffprobe", "-v", "error", "-print_format", "default=noprint_wrappers=1:nokey=1", "-show_entries", "format=duration"]
+    if headers:
+        cmd += ["-headers", build_header_string(headers)]
+    if user_agent:
+        cmd += ["-user_agent", user_agent]
+    cmd += [input_url]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout, check=False)
+        if proc.stdout.strip():
+            return float(proc.stdout.strip())
+    except Exception:
+        return None
+    return None
+
+# ------------------ Main Conversion Logic ------------------ #
+def convert_m3u8_to_mp4(input_url, output_path, headers=None, user_agent=None, retries=3, timeout=0):
+    if not ffmpeg_available():
+        raise RuntimeError("ffmpeg not found on PATH. Please install ffmpeg.")
+
+    total_duration = get_duration_seconds(input_url, headers=headers, user_agent=user_agent)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-loglevel", "info", "-stats",
+        "-allowed_extensions", "ALL",
+        "-protocol_whitelist", "file,crypto,http,https,tcp,tls"
+    ]
+    if user_agent:
+        cmd += ["-user_agent", user_agent]
+    if headers:
+        cmd += ["-headers", build_header_string(headers)]
+    if timeout and timeout > 0:
+        us = str(int(timeout * 1_000_000))
+        cmd += ["-timeout", us, "-rw_timeout", us]
+    cmd += ["-i", input_url, "-c", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", output_path]
+
+    attempt = 1
+    while attempt <= max(1, retries):
+        print(f"[ffmpeg] Starting (attempt {attempt}/{retries})...")
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        start_time = time.time()
+        last_print = 0.0
+        try:
+            for line in proc.stderr:
+                if "time=" in line:
+                    try:
+                        tkn = line.split("time=")[1].split()[0]
+                        h, m, s = tkn.split(":")
+                        cur_seconds = float(h) * 3600 + float(m) * 60 + float(s)
+                        now = time.time()
+                        if now - last_print > 0.5:
+                            if total_duration and total_duration > 0:
+                                pct = min(99.9, (cur_seconds / total_duration) * 100.0)
+                                sys.stdout.write(f"\rProgress: {pct:5.1f}%  ({cur_seconds:,.1f}s / {total_duration:,.1f}s)")
+                            else:
+                                sys.stdout.write(f"\rTime: {cur_seconds:,.1f}s (total unknown)")
+                            sys.stdout.flush()
+                            last_print = now
+                    except Exception:
+                        pass
+                if "Error" in line or "error" in line:
+                    sys.stderr.write(line)
+            ret = proc.wait()
+            sys.stdout.write("\n")
+            if ret == 0:
+                print(f"Done: {output_path}")
+                return True
+            else:
+                print(f"ffmpeg exited with code {ret}.")
+        except KeyboardInterrupt:
+            proc.kill()
+            print("\nAborted by user.")
+            return False
+        attempt += 1
+        if attempt <= retries:
+            print("Retrying...")
+            time.sleep(1.5)
+    return False
+
+# ------------------ Main Entry ------------------ #
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Convert/Download .m3u8 (HLS) or .mp4 to .mp4 with optional GUI file picker.")
+    parser.add_argument("-i", "--input", help="Input .m3u8 URL or local path")
+    parser.add_argument("-o", "--output", help="Output MP4 path (e.g., video.mp4)")
+    parser.add_argument("--header", action="append", help="Extra HTTP header, e.g. 'Authorization: Bearer ...'. Can be used multiple times.")
+    parser.add_argument("--user-agent", default=None, help="Custom User-Agent string")
+    parser.add_argument("--retries", type=int, default=3, help="Retry attempts on failure (default: 3)")
+    parser.add_argument("--timeout", type=float, default=0, help="Network read/write timeout in seconds (default: 0)")
+    args = parser.parse_args()
+
+    # If no input provided, open file picker
+    if not args.input:
+        args.input = pick_file(title="Select .m3u8 or .mp4 file", filetypes=(("M3U8 files", "*.m3u8"), ("All files", "*.*")))
+        if not args.input:
+            print("No file selected. Exiting.")
+            sys.exit(1)
+
+    # If no output provided, ask where to save
+    if not args.output:
+        args.output = pick_save_as(title="Save MP4 as", defaultextension=".mp4")
+        if not args.output:
+            print("No save location selected. Exiting.")
+            sys.exit(1)
+
+    headers = parse_kv_list(args.header) if args.header else None
+    os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
+
+    ok = convert_m3u8_to_mp4(
+        input_url=args.input,
+        output_path=args.output,
+        headers=headers,
+        user_agent=args.user_agent,
+        retries=args.retries,
+        timeout=args.timeout
+    )
+    sys.exit(0 if ok else 1)
